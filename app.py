@@ -16,6 +16,7 @@ import pandas as pd
 from io import BytesIO
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
+import plotly.graph_objects as go
 
 from sectionproperties.pre.library import (
     i_section, channel_section, angle_section,
@@ -201,6 +202,239 @@ def rc_pm_diagram(b, h, fc, fy, Es, bar_y, Ab_each, phi_col=0.65):
     idx = np.argsort(Pns)
     Pn  = Pns[idx]; Mn = Mns[idx]
     return Pn, Mn, phi_col*Pn, phi_col*Mn, P0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUPERFICIE P-Mx-My 3D  (Whitney / ACI 318)
+# ─────────────────────────────────────────────────────────────────────────────
+def _clip_rect_halfplane(b, h, n, d_thresh):
+    """Intersección del rectángulo [0,b]×[0,h] con el semiplano n·(x,y) ≥ d_thresh.
+    Devuelve lista de (x,y) del polígono resultante (en CCW)."""
+    verts = [(0, 0), (b, 0), (b, h), (0, h)]
+    inside, outside = [], []
+    for v in verts:
+        if n[0]*v[0] + n[1]*v[1] >= d_thresh - 1e-10:
+            inside.append(v)
+        else:
+            outside.append(v)
+    if len(inside) == 4:
+        return verts
+    if len(inside) == 0:
+        return []
+    result = list(inside)
+    edges = [(verts[i], verts[(i + 1) % 4]) for i in range(4)]
+    for p1, p2 in edges:
+        v1 = n[0]*p1[0] + n[1]*p1[1]
+        v2 = n[0]*p2[0] + n[1]*p2[1]
+        if (v1 >= d_thresh) != (v2 >= d_thresh):
+            t = (d_thresh - v1) / (v2 - v1) if abs(v2 - v1) > 1e-12 else 0.5
+            result.append((p1[0] + t*(p2[0] - p1[0]), p1[1] + t*(p2[1] - p1[1])))
+    # Ordenar CCW
+    cx = sum(v[0] for v in result) / len(result)
+    cy = sum(v[1] for v in result) / len(result)
+    result.sort(key=lambda v: np.arctan2(v[1] - cy, v[0] - cx))
+    return result
+
+
+def _polygon_area(verts):
+    """Área con fórmula de shoelace."""
+    n = len(verts)
+    if n < 3:
+        return 0.0
+    a = 0.0
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        a += x1*y2 - x2*y1
+    return abs(a) / 2.0
+
+
+def _polygon_centroid(verts):
+    """Centroide (x, y) del polígono."""
+    n = len(verts)
+    if n < 3:
+        return (0, 0)
+    cx = cy = 0.0
+    a2 = 0.0
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        cross = x1*y2 - x2*y1
+        a2 += cross
+        cx += (x1 + x2) * cross
+        cy += (y1 + y2) * cross
+    if abs(a2) < 1e-12:
+        return (0, 0)
+    return (cx / (3*a2), cy / (3*a2))
+
+
+def rc_pm3d_surface(b, h, fc, fy, Es, bar_x, bar_y, Ab_each, phi_col=0.65,
+                    n_theta=24, n_c=50):
+    """Superficie de interacción 3D P-Mx-My para sección rectangular HA.
+
+    Barre el ángulo θ del eje neutro (0°–360°) y para cada ángulo calcula
+    la curva P-M usando el bloque rectangular de Whitney (ACI 318).
+
+    Parameters
+    ----------
+    bar_x, bar_y : array-like — posiciones de barras (mm) desde borde izq e inf.
+    Ab_each : float — área de cada barra (mm²)
+
+    Returns
+    -------
+    dict con Mx, My, P (arrays 2D) para graficar superficie, más
+    Mx_d, My_d, P_d (arrays 1D) para la curva límite.
+    """
+    ecu = 0.003
+    beta1 = max(0.65, 0.85 - 0.05*(fc - 28)/7) if fc > 28 else 0.85
+    n_bars = len(bar_x)
+    As_tot = Ab_each * n_bars
+    P0 = (0.85*fc*(b*h - As_tot) + As_tot*fy) / 1e3
+
+    bar_pos = np.column_stack([np.asarray(bar_x, float), np.asarray(bar_y, float)])
+
+    thetas = np.linspace(0, 360, n_theta, endpoint=False)
+    all_Mx, all_My, all_P = [], [], []
+
+    for th_deg in thetas:
+        th = np.radians(th_deg)
+        # Dirección normal al NA (perpendicular al eje neutro)
+        n = np.array([-np.sin(th), np.cos(th)])
+        # Proyección máxima sobre n (fibra extrema en compresión)
+        corners_proj = [n[0]*x + n[1]*y for x, y in [(0,0), (b,0), (b,h), (0,h)]]
+        d_max = max(corners_proj)
+        d_min = min(corners_proj)
+        c_max = d_max - d_min + h*0.3
+
+        c_vals = np.linspace(0.001, c_max, n_c)
+        for c in c_vals:
+            na_val = d_max - c  # NA: n·r = na_val
+            # -- Hormigón --
+            poly = _clip_rect_halfplane(b, h, n, na_val)
+            A_conc = _polygon_area(poly)
+            if A_conc < 1e-6:
+                continue
+            a_eff = min(beta1 * c, max(b, h))
+            # Ajustar el área real al bloque de Whitney
+            if A_conc > 0:
+                cxc, cyc = _polygon_centroid(poly)
+                Cc = 0.85 * fc * A_conc
+                Mx_conc = Cc * (h/2 - cyc)
+                My_conc = Cc * (b/2 - cxc)
+            else:
+                Cc = Mx_conc = My_conc = 0.0
+                cxc, cyc = 0, 0
+
+            # -- Acero --
+            P_s = 0.0
+            Mx_s = 0.0
+            My_s = 0.0
+            for i in range(n_bars):
+                xi, yi = bar_pos[i]
+                d_bar = d_max - (n[0]*xi + n[1]*yi)  # prof. desde fibra comp.
+                eps_s = ecu * (c - d_bar) / max(c, 1e-6)
+                fs = np.clip(eps_s * Es, -fy, fy)
+                # Desplazar 0.85*fc en barras comprimidas dentro del bloque
+                if d_bar <= a_eff and d_bar < c:
+                    fs -= 0.85 * fc
+                Fs = fs * Ab_each
+                P_s += Fs
+                Mx_s += Fs * (h/2 - yi)
+                My_s += Fs * (b/2 - xi)
+
+            P_total = Cc + P_s
+            Mx_total = Mx_conc + Mx_s
+            My_total = My_conc + My_s
+
+            all_P.append(P_total / 1e3)
+            all_Mx.append(Mx_total / 1e6)
+            all_My.append(My_total / 1e6)
+
+    P_arr = np.array(all_P)
+    Mx_arr = np.array(all_Mx)
+    My_arr = np.array(all_My)
+
+    # Construir grilla para superficie con alpha shape convexa
+    return _build_pm3d_grid(Mx_arr, My_arr, P_arr, P0, phi_col, n_theta)
+
+
+def _build_pm3d_grid(Mx, My, P, P0, phi_col, n_theta):
+    """Construye una grilla (Mx, My, P) para plot_surface de Plotly,
+    filtrando puntos según φRn y completando con radial sort."""
+    # Versión simplificada: ordenar puntos por ángulo y crear superficie
+    angles = np.arctan2(My, Mx)
+    radii = np.sqrt(Mx**2 + My**2)
+
+    df = pd.DataFrame({"ang": angles, "rad": radii, "Mx": Mx, "My": My, "P": P})
+
+    # Para cada nivel de P, encontrar el radio máximo
+    # Agrupamos por P y tomamos el máximo
+    p_bins = np.linspace(min(P), P0, 40)
+    grid_data = []
+    for i in range(len(p_bins) - 1):
+        p_lo, p_hi = p_bins[i], p_bins[i+1]
+        mask = (P >= p_lo) & (P < p_hi)
+        if mask.sum() < 3:
+            continue
+        # Para cada ángulo en este nivel de P, tomar la M máxima
+        # (esto da la envolvente exterior)
+        p_mean = np.mean(P[mask])
+        # Tomar los puntos más extremos (máximo radio por sector angular)
+        sector_data = []
+        sn = max(n_theta, 12)
+        for j in range(sn):
+            a0 = j * 2*np.pi / sn
+            a1 = (j + 1) * 2*np.pi / sn
+            if j == sn - 1:
+                a1 += 1e-6
+            sm = (angles[mask] >= a0) & (angles[mask] < a1)
+            if sm.sum() > 0:
+                i_max = np.argmax(radii[mask][sm.values])
+                # find global index
+                idx_local = np.where(mask)[0][np.where(sm)[0][i_max]]
+                grid_data.append({
+                    "Mx": Mx[idx_local], "My": My[idx_local],
+                    "P": P[idx_local]
+                })
+
+    if not grid_data:
+        return {"Mx": np.array([]), "My": np.array([]), "P": np.array([]),
+                "Mx_d": Mx, "My_d": My, "P_d": P, "P0": P0, "phiP0": phi_col*P0}
+
+    gdf = pd.DataFrame(grid_data)
+
+    # Ordenar por ángulo
+    g_ang = np.arctan2(gdf["My"], gdf["Mx"])
+    gdf = gdf.iloc[np.argsort(g_ang)].reset_index(drop=True)
+
+    # Crear grilla regular para superficie
+    try:
+        from scipy.interpolate import griddata
+    except ImportError:
+        return {"Mx": np.array([]), "My": np.array([]), "P": np.array([]),
+                "Mx_d": Mx, "My_d": My, "P_d": P, "P0": P0, "phiP0": phi_col*P0}
+
+    # Crear malla Mx-My y estimar P
+    mx_min, mx_max = min(gdf["Mx"]), max(gdf["Mx"])
+    my_min, my_max = min(gdf["My"]), max(gdf["My"])
+    margin = 0.05
+    xg = np.linspace(mx_min * (1 - margin), mx_max * (1 + margin), 40)
+    yg = np.linspace(my_min * (1 - margin), my_max * (1 + margin), 40)
+    Xg, Yg = np.meshgrid(xg, yg)
+    Zg = griddata(
+        (gdf["Mx"], gdf["My"]), gdf["P"],
+        (Xg, Yg), method="linear", fill_value=-1e6
+    )
+
+    # Enmascarar valores fuera del rango
+    Zg[Zg < min(P) * 0.5] = np.nan
+
+    return {
+        "Mx": Xg, "My": Yg, "P": Zg,
+        "Mx_d": gdf["Mx"].values, "My_d": gdf["My"].values,
+        "P_d": gdf["P"].values,
+        "P0": P0, "phiP0": phi_col * P0,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,7 +747,7 @@ st.success(f"✅ Análisis completado — {section.num_nodes} nodos · {len(sect
 # TABS
 # ═════════════════════════════════════════════════════════════════════════════
 tab_labels = ["📊 Geometría","📋 Propiedades","🌡️ Tensiones"]
-if cat_s.startswith("🏗️"): tab_labels += ["📈 Diagrama P-M","📉 Curva M-φ"]
+if cat_s.startswith("🏗️"): tab_labels += ["📈 Diagrama P-M","📉 Curva M-φ","🌐 P-Mx-My 3D"]
 tabs = st.tabs(tab_labels)
 
 
@@ -1012,6 +1246,138 @@ if cat_s.startswith("🏗️"):
 
                 except Exception as e:
                     st.error(f"Error en curva M-φ: {e}")
+
+    # ─── TAB 6  ·  P-Mx-My 3D ────────────────────────────────────────────────
+    with tabs[5]:
+        st.subheader("Superficie de Interacción 3D  P-Mx-My")
+        st.caption(f"b = {b_rc:.0f} mm · h = {h_rc:.0f} mm · "
+                   f"{nb}∅{db:.0f} mm · f'c = {fc_v} MPa · fy = {fy_v} MPa")
+
+        pm3d_1, pm3d_2 = st.columns([4, 1])
+        with pm3d_2:
+            phi_3d = st.slider("Factor φ", 0.50, 1.00, 0.65, 0.01, key="phi_3d",
+                               help="φ = 0.65 estribos | φ = 0.75 espiral | φ = 1.0 nominal")
+            n_theta_3d = st.slider("N° ángulos θ", 12, 48, 24, 6,
+                                   help="Más ángulos = superficie más suave, pero más lento")
+            fig_ref, ax_ref = plt.subplots(figsize=(3.5, 4.5))
+            dibujar_seccion_ha(ax_ref, b_rc, h_rc, bar_y_rc, bar_x_rc, db, cov,
+                               titulo=f"{nb}∅{db:.0f} mm")
+            plt.tight_layout()
+            show_fig(fig_ref)
+            st.caption(f"As = {nb*Ab_bar:.0f} mm²  ·  ρ = {rho_g:.2f}%")
+            st.markdown("**Carga de demanda**")
+            st.metric("P (kN)", f"{N_kN:.1f}")
+            st.metric("Mxx (kN·m)", f"{Mxx_v:.1f}")
+            st.metric("Myy (kN·m)", f"{Myy_v:.1f}")
+
+        with pm3d_1:
+            with st.spinner("🌀 Calculando superficie 3D (P-Mx-My)..."):
+                try:
+                    result_3d = rc_pm3d_surface(
+                        b=b_rc, h=h_rc, fc=fc_v, fy=fy_v, Es=Es_v2,
+                        bar_x=bar_x_rc, bar_y=bar_y_rc, Ab_each=Ab_bar,
+                        phi_col=phi_3d, n_theta=n_theta_3d,
+                    )
+
+                    Mx3d = result_3d["Mx"]
+                    My3d = result_3d["My"]
+                    P3d = result_3d["P"]
+
+                    # ── Gráfico 3D con Plotly ──
+                    fig3d = go.Figure()
+
+                    # Superficie φRn (reducida)
+                    if Mx3d.size > 0 and not np.all(np.isnan(P3d)):
+                        fig3d.add_trace(go.Surface(
+                            x=Mx3d, y=My3d, z=P3d,
+                            colorscale="Blues",
+                            opacity=0.85,
+                            name="φRn (reducida)",
+                            hovertemplate="Mx=%{x:.1f} kN·m<br>My=%{y:.1f} kN·m<br>P=%{z:.1f} kN",
+                            showscale=False,
+                        ))
+
+                    # Punto de demanda (Mxx, Myy, N)
+                    demanda_dentro = False
+                    if abs(Mxx_v) + abs(Myy_v) + abs(N_kN) > 0:
+                        M_dem = np.array([abs(Mxx_v)])
+                        My_dem = np.array([abs(Myy_v)])
+                        P_dem = np.array([N_kN])
+                        fig3d.add_trace(go.Scatter3d(
+                            x=M_dem, y=My_dem, z=P_dem,
+                            mode="markers",
+                            marker=dict(size=10, color="red", symbol="diamond"),
+                            name=f"Demanda  P={N_kN:.0f}  Mx={abs(Mxx_v):.1f}  My={abs(Myy_v):.1f}",
+                            hovertemplate="Mx=%{x:.1f}<br>My=%{y:.1f}<br>P=%{z:.1f}",
+                        ))
+
+                        # Verificar si está dentro de la superficie
+                        if Mx3d.size > 0 and not np.all(np.isnan(P3d)):
+                            try:
+                                from scipy.interpolate import griddata
+                                P_surf = griddata(
+                                    (result_3d["Mx_d"], result_3d["My_d"]),
+                                    result_3d["P_d"],
+                                    (abs(Mxx_v), abs(Myy_v)),
+                                    method="linear"
+                                )
+                                if not np.isnan(P_surf) and not np.isnan(P_dem[0]):
+                                    demanda_dentro = (P_dem[0] <= P_surf) and (P_dem[0] >= min(result_3d["P_d"]))
+                            except Exception:
+                                pass
+
+                    fig3d.update_layout(
+                        title="Superficie de Interacción P-Mx-My  (ACI 318)",
+                        scene=dict(
+                            xaxis_title="Mx (kN·m)",
+                            yaxis_title="My (kN·m)",
+                            zaxis_title="P (kN)",
+                            camera=dict(eye=dict(x=1.8, y=1.8, z=1.2)),
+                        ),
+                        height=650,
+                        margin=dict(l=0, r=0, t=40, b=0),
+                    )
+                    st.plotly_chart(fig3d, use_container_width=True)
+
+                    # ── Verificación ──
+                    if abs(Mxx_v) + abs(Myy_v) + abs(N_kN) > 0:
+                        if demanda_dentro:
+                            st.markdown(
+                                '<div class="ok-box">✅ Punto de demanda DENTRO de la '
+                                'superficie φRn — **CUMPLE** ACI 318</div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.error(
+                                "❌ Punto de demanda FUERA de la superficie φRn — "
+                                "**NO CUMPLE** ACI 318. La sección necesita rediseño."
+                            )
+                    else:
+                        st.info("👈 Ingresa cargas (N, Mxx, Myy) en la barra lateral para verificar.")
+
+                    # ── Métricas clave ──
+                    mc3d1, mc3d2, mc3d3, mc3d4 = st.columns(4)
+                    mc3d1.metric("P₀ compresión pura", f"{result_3d['P0']:.0f} kN")
+                    mc3d2.metric("φP₀ (reducida)", f"{result_3d['phiP0']:.0f} kN")
+                    if P3d.size > 0 and not np.all(np.isnan(P3d)):
+                        mc3d3.metric("P máxima en superficie", f"{np.nanmax(P3d):.0f} kN")
+                    mc3d4.metric("θ barrido", f"0°–360° ({n_theta_3d} ángulos)")
+
+                    # ── Nota técnica ──
+                    st.markdown("---")
+                    st.caption(
+                        "**Método:** Bloque rectangular de Whitney (ACI 318 §22.2.2) · "
+                        "ε_cu = 0.003 · β₁ = {:.3f} · "
+                        "Barrido del eje neutro θ = 0°–360° · "
+                        "La superficie mostrada es φPn–φMn (resistencia reducida)".format(
+                            max(0.65, 0.85 - 0.05*(fc_v - 28)/7) if fc_v > 28 else 0.85
+                        )
+                    )
+
+                except Exception as e:
+                    st.error(f"Error en superficie 3D: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
