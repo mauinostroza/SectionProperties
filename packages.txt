@@ -1,2 +1,5 @@
-# Dependencias del sistema para sectionproperties / cytriangle
-build-essential
+# Paquetes del sistema necesarios para compilar cytriangle en ARM64
+gcc
+g++
+make
+python3-dev
