@@ -1,5 +1,7 @@
-# Paquetes del sistema necesarios para compilar cytriangle en ARM64
+# Paquetes del sistema necesarios para compilar cytriangle en x86_64
 gcc
 g++
 make
-python3-dev
+cmake
+libgeos-dev
+python3.11-dev
