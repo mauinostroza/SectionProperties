@@ -1,0 +1,62 @@
+[
+  {
+    "id": "rect_300x500",
+    "type": "Rectangular",
+    "name": "Rectangular 300×500",
+    "params": {"b": 300, "h": 500},
+    "default_fc": 25,
+    "default_fy": 420,
+    "default_cover": 40,
+    "icon": "📦"
+  },
+  {
+    "id": "rect_400x600",
+    "type": "Rectangular",
+    "name": "Rectangular 400×600",
+    "params": {"b": 400, "h": 600},
+    "default_fc": 25,
+    "default_fy": 420,
+    "default_cover": 40,
+    "icon": "📦"
+  },
+  {
+    "id": "circ_500",
+    "type": "Circular",
+    "name": "Circular Ø500",
+    "params": {"d": 500},
+    "default_fc": 30,
+    "default_fy": 420,
+    "default_cover": 40,
+    "icon": "🔵"
+  },
+  {
+    "id": "tee_800x600",
+    "type": "T",
+    "name": "T 800×600",
+    "params": {"b_f": 800, "h_f": 150, "b_w": 300, "h_w": 450},
+    "default_fc": 25,
+    "default_fy": 420,
+    "default_cover": 40,
+    "icon": "⫘"
+  },
+  {
+    "id": "i_w24x62",
+    "type": "I",
+    "name": "I W24×62 (aprox)",
+    "params": {"b_f": 228, "h_f": 610, "b_w": 12, "h_w": 610, "t_f": 22},
+    "default_fc": 25,
+    "default_fy": 345,
+    "default_cover": 0,
+    "icon": "⧉"
+  },
+  {
+    "id": "box_600x400x30",
+    "type": "Cajón",
+    "name": "Cajón 600×400×30",
+    "params": {"b": 600, "d": 400, "t": 30},
+    "default_fc": 25,
+    "default_fy": 420,
+    "default_cover": 30,
+    "icon": "⬜"
+  }
+]
